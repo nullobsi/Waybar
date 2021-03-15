@@ -120,17 +120,26 @@ void waybar::Client::handleOutputDone(void *data, struct zxdg_output_v1 * /*xdg_
   auto client = waybar::Client::inst();
   try {
     auto &output = client->getOutput(data);
-    spdlog::debug("Output detection done: {} ({})", output.name, output.identifier);
+    /**
+     * Multiple .done events may arrive in batch. In this case libwayland would queue
+     * xdg_output.destroy and dispatch all pending events, triggering this callback several times
+     * for the same output. .done events can also arrive after that for a scale or position changes.
+     * We wouldn't want to draw a duplicate bar for each such event either.
+     *
+     * All the properties we care about are immutable so it's safe to delete the xdg_output object
+     * on the first event and use the ptr value to check that the callback was already invoked.
+     */
+    if (output.xdg_output) {
+      output.xdg_output.reset();
+      spdlog::debug("Output detection done: {} ({})", output.name, output.identifier);
 
-    auto configs = client->getOutputConfigs(output);
-    if (!configs.empty()) {
-      wl_display_roundtrip(client->wl_display);
-      for (const auto &config : configs) {
-        client->bars.emplace_back(std::make_unique<Bar>(&output, config));
+      auto configs = client->getOutputConfigs(output);
+      if (!configs.empty()) {
+        for (const auto &config : configs) {
+          client->bars.emplace_back(std::make_unique<Bar>(&output, config));
+        }
       }
     }
-    // unsubscribe
-    output.xdg_output.reset();
   } catch (const std::exception &e) {
     std::cerr << e.what() << std::endl;
   }
@@ -170,6 +179,16 @@ void waybar::Client::handleMonitorAdded(Glib::RefPtr<Gdk::Monitor> monitor) {
 
 void waybar::Client::handleMonitorRemoved(Glib::RefPtr<Gdk::Monitor> monitor) {
   spdlog::debug("Output removed: {} {}", monitor->get_manufacturer(), monitor->get_model());
+  /* This event can be triggered from wl_display_roundtrip called by GTK or our code.
+   * Defer destruction of bars for the output to the next iteration of the event loop to avoid
+   * deleting objects referenced by currently executed code.
+   */
+  Glib::signal_idle().connect_once(
+      sigc::bind(sigc::mem_fun(*this, &Client::handleDeferredMonitorRemoval), monitor),
+      Glib::PRIORITY_HIGH_IDLE);
+}
+
+void waybar::Client::handleDeferredMonitorRemoval(Glib::RefPtr<Gdk::Monitor> monitor) {
   for (auto it = bars.begin(); it != bars.end();) {
     if ((*it)->output->monitor == monitor) {
       auto output_name = (*it)->output->name;
